@@ -267,12 +267,10 @@ impl LineWrapper {
 
     #[inline(always)]
     fn width_for_grapheme(&mut self, grapheme: &str) -> Pixels {
-        // For single ASCII characters, use the fast path
-        if grapheme.len() == 1 {
+        // For single-character graphemes, use the existing char cache
+        if grapheme.len() == 1 || grapheme.chars().count() == 1 {
             let c = grapheme.chars().next().unwrap();
-            if (c as u32) < 128 {
-                return self.width_for_char(c);
-            }
+            return self.width_for_char(c);
         }
         
         // For multi-character graphemes (e.g., base + combining marks), 
@@ -353,12 +351,13 @@ impl<'a> LineFragment<'a> {
         
         // Use grapheme clusters for proper handling of combining characters (e.g., Thai)
         Box::new(text.graphemes(true).map(|grapheme| {
-            // For single ASCII characters, we can use the old Char variant for compatibility
-            if grapheme.len() == 1 && grapheme.chars().next().unwrap().is_ascii() {
+            // For single-character graphemes, use the Char variant which has optimized caching
+            if grapheme.chars().count() == 1 {
                 WrapBoundaryCandidate::Char { 
                     character: grapheme.chars().next().unwrap() 
                 }
             } else {
+                // For multi-character graphemes (base + combining marks), use the Grapheme variant
                 WrapBoundaryCandidate::Grapheme { grapheme }
             }
         })) as Box<dyn Iterator<Item = WrapBoundaryCandidate<'a>>>
@@ -767,13 +766,13 @@ mod tests {
         // Test that we can wrap Thai text
         // The exact boundaries may vary based on the font, but it should not panic
         // and should treat grapheme clusters as atomic units
-        let boundaries: Vec<_> = wrapper
+        let _boundaries: Vec<_> = wrapper
             .wrap_line(&[LineFragment::text(thai_text)], px(72.))
             .collect();
         
+        // If we got here without panicking, the test passed
         // Thai text should be wrappable (similar to CJK)
         // The important thing is that combining characters stay with their base
-        assert!(boundaries.len() >= 0); // Should not panic
         
         // Test truncation with Thai text
         let (truncated, _) = wrapper.truncate_line(
