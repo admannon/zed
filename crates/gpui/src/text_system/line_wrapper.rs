@@ -4,12 +4,19 @@ use std::{borrow::Cow, iter, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
+/// 
+/// This wrapper processes text as grapheme clusters to properly handle
+/// complex scripts like Thai, which use combining characters (vowels, tone marks)
+/// that should not add width in monospace fonts.
 pub struct LineWrapper {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
+    /// Fast path for ASCII characters
     cached_ascii_char_widths: [Option<Pixels>; 128],
+    /// Cache for non-ASCII single characters
     cached_other_char_widths: HashMap<char, Pixels>,
+    /// Cache for multi-character grapheme clusters (e.g., Thai base + combining marks)
     cached_grapheme_widths: HashMap<String, Pixels>,
 }
 
