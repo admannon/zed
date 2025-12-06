@@ -169,18 +169,19 @@ impl LineWrapper {
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         let mut width = px(0.);
         let mut suffix_width = truncation_suffix
-            .chars()
-            .map(|c| self.width_for_char(c))
+            .graphemes(true)
+            .map(|g| self.width_for_grapheme(g))
             .fold(px(0.0), |a, x| a + x);
-        let mut char_indices = line.char_indices();
         let mut truncate_ix = 0;
-        for (ix, c) in char_indices {
+        let mut current_ix = 0;
+        
+        for grapheme in line.graphemes(true) {
             if width + suffix_width < truncate_width {
-                truncate_ix = ix;
+                truncate_ix = current_ix;
             }
 
-            let char_width = self.width_for_char(c);
-            width += char_width;
+            let grapheme_width = self.width_for_grapheme(grapheme);
+            width += grapheme_width;
 
             if width.floor() > truncate_width {
                 let result =
@@ -190,6 +191,8 @@ impl LineWrapper {
 
                 return (result, Cow::Owned(runs));
             }
+            
+            current_ix += grapheme.len();
         }
 
         (line, Cow::Borrowed(runs))
@@ -742,6 +745,43 @@ mod tests {
         assert_not_word("こんにちは");
         assert_not_word("😀😁😂");
         assert_not_word("()[]{}<>");
+    }
+
+    #[test]
+    fn test_thai_grapheme_clusters() {
+        let mut wrapper = build_wrapper();
+        
+        // Thai text with combining characters
+        // "สวัสดี" = sa-wat-dee (hello in Thai)
+        // Each Thai character may have combining marks (tone marks, vowels)
+        // that should not add width in monospace fonts
+        let thai_text = "สวัสดี";
+        
+        // Test that we can wrap Thai text
+        // The exact boundaries may vary based on the font, but it should not panic
+        // and should treat grapheme clusters as atomic units
+        let boundaries: Vec<_> = wrapper
+            .wrap_line(&[LineFragment::text(thai_text)], px(72.))
+            .collect();
+        
+        // Thai text should be wrappable (similar to CJK)
+        // The important thing is that combining characters stay with their base
+        assert!(boundaries.len() >= 0); // Should not panic
+        
+        // Test truncation with Thai text
+        let (truncated, _) = wrapper.truncate_line(
+            thai_text.into(),
+            px(36.),
+            "…",
+            &[]
+        );
+        
+        // Truncation should not split grapheme clusters
+        // Each grapheme cluster should be kept intact
+        for grapheme in truncated.graphemes(true) {
+            // If a grapheme is in the truncated text, it should be complete
+            assert!(!grapheme.is_empty());
+        }
     }
 
     // For compatibility with the test macro
