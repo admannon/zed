@@ -21,8 +21,8 @@ use editor::{
 };
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageFormat, KeyContext,
-    SharedString, Subscription, Task, TextStyle, WeakEntity,
+    AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageFormat,
+    KeyContext, SharedString, Subscription, Task, TextStyle, WeakEntity,
 };
 use language::{Buffer, Language, language_settings::InlayHintKind};
 use project::{CompletionIntent, InlayHint, InlayHintLabel, InlayId, Project, Worktree};
@@ -34,7 +34,7 @@ use theme::ThemeSettings;
 use ui::prelude::*;
 use util::{ResultExt, debug_panic};
 use workspace::{CollaboratorId, Workspace};
-use zed_actions::agent::Chat;
+use zed_actions::agent::{Chat, PasteRaw};
 
 pub struct MessageEditor {
     mention_set: Entity<MentionSet>,
@@ -417,13 +417,12 @@ impl MessageEditor {
                                     ))
                                 }
                             }
-                            Mention::Image(mention_image) => {
-                                let mut image = acp::ImageContent::new(
+                            Mention::Image(mention_image) => acp::ContentBlock::Image(
+                                acp::ImageContent::new(
                                     mention_image.data.clone(),
                                     mention_image.format.mime_type(),
-                                );
-
-                                if let Some(uri) = match uri {
+                                )
+                                .uri(match uri {
                                     MentionUri::File { .. } => Some(uri.to_uri().to_string()),
                                     MentionUri::PastedImage => None,
                                     other => {
@@ -433,11 +432,8 @@ impl MessageEditor {
                                         );
                                         None
                                     }
-                                } {
-                                    image = image.uri(uri)
-                                };
-                                acp::ContentBlock::Image(image)
-                            }
+                                }),
+                            ),
                             Mention::Link => acp::ContentBlock::ResourceLink(
                                 acp::ResourceLink::new(uri.name(), uri.to_uri().to_string()),
                             ),
@@ -547,12 +543,155 @@ impl MessageEditor {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let editor_clipboard_selections = cx
+            .read_from_clipboard()
+            .and_then(|item| item.entries().first().cloned())
+            .and_then(|entry| match entry {
+                ClipboardEntry::String(text) => {
+                    text.metadata_json::<Vec<editor::ClipboardSelection>>()
+                }
+                _ => None,
+            });
+
+        // Insert creases for pasted clipboard selections that:
+        // 1. Contain exactly one selection
+        // 2. Have an associated file path
+        // 3. Span multiple lines (not single-line selections)
+        // 4. Belong to a file that exists in the current project
+        let should_insert_creases = util::maybe!({
+            let selections = editor_clipboard_selections.as_ref()?;
+            if selections.len() > 1 {
+                return Some(false);
+            }
+            let selection = selections.first()?;
+            let file_path = selection.file_path.as_ref()?;
+            let line_range = selection.line_range.as_ref()?;
+
+            if line_range.start() == line_range.end() {
+                return Some(false);
+            }
+
+            Some(
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .project_path_for_absolute_path(file_path, cx)
+                    .is_some(),
+            )
+        })
+        .unwrap_or(false);
+
+        if should_insert_creases && let Some(selections) = editor_clipboard_selections {
+            cx.stop_propagation();
+            let insertion_target = self
+                .editor
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .start
+                .text_anchor;
+
+            let project = workspace.read(cx).project().clone();
+            for selection in selections {
+                if let (Some(file_path), Some(line_range)) =
+                    (selection.file_path, selection.line_range)
+                {
+                    let crease_text =
+                        acp_thread::selection_name(Some(file_path.as_ref()), &line_range);
+
+                    let mention_uri = MentionUri::Selection {
+                        abs_path: Some(file_path.clone()),
+                        line_range: line_range.clone(),
+                    };
+
+                    let mention_text = mention_uri.as_link().to_string();
+                    let (excerpt_id, text_anchor, content_len) =
+                        self.editor.update(cx, |editor, cx| {
+                            let buffer = editor.buffer().read(cx);
+                            let snapshot = buffer.snapshot(cx);
+                            let (excerpt_id, _, buffer_snapshot) = snapshot.as_singleton().unwrap();
+                            let text_anchor = insertion_target.bias_left(&buffer_snapshot);
+
+                            editor.insert(&mention_text, window, cx);
+                            editor.insert(" ", window, cx);
+
+                            (*excerpt_id, text_anchor, mention_text.len())
+                        });
+
+                    let Some((crease_id, tx)) = insert_crease_for_mention(
+                        excerpt_id,
+                        text_anchor,
+                        content_len,
+                        crease_text.into(),
+                        mention_uri.icon_path(cx),
+                        None,
+                        self.editor.clone(),
+                        window,
+                        cx,
+                    ) else {
+                        continue;
+                    };
+                    drop(tx);
+
+                    let mention_task = cx
+                        .spawn({
+                            let project = project.clone();
+                            async move |_, cx| {
+                                let project_path = project
+                                    .update(cx, |project, cx| {
+                                        project.project_path_for_absolute_path(&file_path, cx)
+                                    })
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "project path not found".to_string())?;
+
+                                let buffer = project
+                                    .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                                    .map_err(|e| e.to_string())?
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+
+                                buffer
+                                    .update(cx, |buffer, cx| {
+                                        let start = Point::new(*line_range.start(), 0)
+                                            .min(buffer.max_point());
+                                        let end = Point::new(*line_range.end() + 1, 0)
+                                            .min(buffer.max_point());
+                                        let content = buffer.text_for_range(start..end).collect();
+                                        Mention::Text {
+                                            content,
+                                            tracked_buffers: vec![cx.entity()],
+                                        }
+                                    })
+                                    .map_err(|e| e.to_string())
+                            }
+                        })
+                        .shared();
+
+                    self.mention_set.update(cx, |mention_set, _cx| {
+                        mention_set.insert_mention(crease_id, mention_uri.clone(), mention_task)
+                    });
+                }
+            }
+            return;
+        }
+
         if self.prompt_capabilities.borrow().image
             && let Some(task) =
                 paste_images_as_context(self.editor.clone(), self.mention_set.clone(), window, cx)
         {
             task.detach();
         }
+    }
+
+    fn paste_raw(&mut self, _: &PasteRaw, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        window.defer(cx, move |window, cx| {
+            editor.update(cx, |editor, cx| editor.paste(&Paste, window, cx));
+        });
     }
 
     pub fn insert_dragged_files(
@@ -832,6 +971,7 @@ impl Render for MessageEditor {
             .on_action(cx.listener(Self::chat))
             .on_action(cx.listener(Self::chat_with_follow))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::paste_raw))
             .capture_action(cx.listener(Self::paste))
             .flex_1()
             .child({
@@ -1230,7 +1370,7 @@ mod tests {
                     cx,
                 );
             });
-            message_editor.read(cx).focus_handle(cx).focus(window);
+            message_editor.read(cx).focus_handle(cx).focus(window, cx);
             message_editor.read(cx).editor().clone()
         });
 
@@ -1452,7 +1592,7 @@ mod tests {
                     cx,
                 );
             });
-            message_editor.read(cx).focus_handle(cx).focus(window);
+            message_editor.read(cx).focus_handle(cx).focus(window, cx);
             let editor = message_editor.read(cx).editor().clone();
             (message_editor, editor)
         });
@@ -2180,7 +2320,7 @@ mod tests {
                     cx,
                 );
             });
-            message_editor.read(cx).focus_handle(cx).focus(window);
+            message_editor.read(cx).focus_handle(cx).focus(window, cx);
             let editor = message_editor.read(cx).editor().clone();
             (message_editor, editor)
         });
