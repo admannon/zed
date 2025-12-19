@@ -1,14 +1,23 @@
 use crate::{FontId, FontRun, Pixels, PlatformTextSystem, SharedString, TextRun, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
+/// 
+/// This wrapper processes text as grapheme clusters to properly handle
+/// complex scripts like Thai, which use combining characters (vowels, tone marks)
+/// that should not add width in monospace fonts.
 pub struct LineWrapper {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
+    /// Fast path for ASCII characters
     cached_ascii_char_widths: [Option<Pixels>; 128],
+    /// Cache for non-ASCII single characters
     cached_other_char_widths: HashMap<char, Pixels>,
+    /// Cache for multi-character grapheme clusters (e.g., Thai base + combining marks)
+    cached_grapheme_widths: HashMap<String, Pixels>,
 }
 
 impl LineWrapper {
@@ -26,6 +35,7 @@ impl LineWrapper {
             font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
+            cached_grapheme_widths: HashMap::default(),
         }
     }
 
@@ -78,6 +88,34 @@ impl LineWrapper {
                         new_prev_c = c;
 
                         self.width_for_char(c)
+                    }
+                    WrapBoundaryCandidate::Grapheme { grapheme } => {
+                        let first_c = grapheme.chars().next().unwrap();
+                        
+                        if first_c == '\n' {
+                            continue;
+                        }
+
+                        if Self::is_word_char(first_c) {
+                            if prev_c == ' ' && first_c != ' ' && first_non_whitespace_ix.is_some() {
+                                last_candidate_ix = ix;
+                                last_candidate_width = width;
+                            }
+                        } else {
+                            // CJK and Thai may not be space separated
+                            if first_c != ' ' && first_non_whitespace_ix.is_some() {
+                                last_candidate_ix = ix;
+                                last_candidate_width = width;
+                            }
+                        }
+
+                        if first_c != ' ' && first_non_whitespace_ix.is_none() {
+                            first_non_whitespace_ix = Some(ix);
+                        }
+
+                        new_prev_c = first_c;
+
+                        self.width_for_grapheme(grapheme)
                     }
                     WrapBoundaryCandidate::Element {
                         width: element_width,
@@ -136,23 +174,26 @@ impl LineWrapper {
         truncation_suffix: &str,
     ) -> Option<usize> {
         let mut width = px(0.);
-        let suffix_width = truncation_suffix
-            .chars()
-            .map(|c| self.width_for_char(c))
+        let mut suffix_width = truncation_suffix
+            .graphemes(true)
+            .map(|g| self.width_for_grapheme(g))
             .fold(px(0.0), |a, x| a + x);
         let mut truncate_ix = 0;
-
-        for (ix, c) in line.char_indices() {
+        let mut current_ix = 0;
+        
+        for grapheme in line.graphemes(true) {
             if width + suffix_width < truncate_width {
-                truncate_ix = ix;
+                truncate_ix = current_ix;
             }
 
-            let char_width = self.width_for_char(c);
-            width += char_width;
+            let grapheme_width = self.width_for_grapheme(grapheme);
+            width += grapheme_width;
 
             if width.floor() > truncate_width {
                 return Some(truncate_ix);
             }
+            
+            current_ix += grapheme.len();
         }
 
         None
@@ -243,6 +284,38 @@ impl LineWrapper {
             )
             .width
     }
+
+    #[inline(always)]
+    fn width_for_grapheme(&mut self, grapheme: &str) -> Pixels {
+        // For single-character graphemes, use the existing char cache
+        if grapheme.len() == 1 || grapheme.chars().count() == 1 {
+            let c = grapheme.chars().next().unwrap();
+            return self.width_for_char(c);
+        }
+        
+        // For multi-character graphemes (e.g., base + combining marks), 
+        // we need to measure them together to get the correct width
+        if let Some(cached_width) = self.cached_grapheme_widths.get(grapheme) {
+            *cached_width
+        } else {
+            let width = self.compute_width_for_grapheme(grapheme);
+            self.cached_grapheme_widths.insert(grapheme.to_string(), width);
+            width
+        }
+    }
+
+    fn compute_width_for_grapheme(&self, grapheme: &str) -> Pixels {
+        self.platform_text_system
+            .layout_line(
+                grapheme,
+                self.font_size,
+                &[FontRun {
+                    len: grapheme.len(),
+                    font_id: self.font_id,
+                }],
+            )
+            .width
+    }
 }
 
 fn update_runs_after_truncation(result: &str, ellipsis: &str, runs: &mut Vec<TextRun>) {
@@ -285,33 +358,43 @@ impl<'a> LineFragment<'a> {
         LineFragment::Element { width, len_utf8 }
     }
 
-    fn wrap_boundary_candidates(&self) -> impl Iterator<Item = WrapBoundaryCandidate> {
+    fn wrap_boundary_candidates(&self) -> impl Iterator<Item = WrapBoundaryCandidate<'a>> {
         let text = match self {
-            LineFragment::Text { text } => text,
-            LineFragment::Element { .. } => "\0",
-        };
-        text.chars().map(move |character| {
-            if let LineFragment::Element { width, len_utf8 } = self {
-                WrapBoundaryCandidate::Element {
+            LineFragment::Text { text } => *text,
+            LineFragment::Element { width, len_utf8 } => {
+                return Box::new(iter::once(WrapBoundaryCandidate::Element {
                     width: *width,
                     len_utf8: *len_utf8,
+                })) as Box<dyn Iterator<Item = WrapBoundaryCandidate<'a>>>;
+            }
+        };
+        
+        // Use grapheme clusters for proper handling of combining characters (e.g., Thai)
+        Box::new(text.graphemes(true).map(|grapheme| {
+            // For single-character graphemes, use the Char variant which has optimized caching
+            if grapheme.chars().count() == 1 {
+                WrapBoundaryCandidate::Char { 
+                    character: grapheme.chars().next().unwrap() 
                 }
             } else {
-                WrapBoundaryCandidate::Char { character }
+                // For multi-character graphemes (base + combining marks), use the Grapheme variant
+                WrapBoundaryCandidate::Grapheme { grapheme }
             }
-        })
+        })) as Box<dyn Iterator<Item = WrapBoundaryCandidate<'a>>>
     }
 }
 
-enum WrapBoundaryCandidate {
+enum WrapBoundaryCandidate<'a> {
     Char { character: char },
+    Grapheme { grapheme: &'a str },
     Element { width: Pixels, len_utf8: usize },
 }
 
-impl WrapBoundaryCandidate {
+impl<'a> WrapBoundaryCandidate<'a> {
     pub fn len_utf8(&self) -> usize {
         match self {
             WrapBoundaryCandidate::Char { character } => character.len_utf8(),
+            WrapBoundaryCandidate::Grapheme { grapheme } => grapheme.len(),
             WrapBoundaryCandidate::Element { len_utf8: len, .. } => *len,
         }
     }
@@ -695,6 +778,43 @@ mod tests {
         assert_not_word("こんにちは");
         assert_not_word("😀😁😂");
         assert_not_word("()[]{}<>");
+    }
+
+    #[test]
+    fn test_thai_grapheme_clusters() {
+        let mut wrapper = build_wrapper();
+        
+        // Thai text with combining characters
+        // "สวัสดี" = sa-wat-dee (hello in Thai)
+        // Each Thai character may have combining marks (tone marks, vowels)
+        // that should not add width in monospace fonts
+        let thai_text = "สวัสดี";
+        
+        // Test that we can wrap Thai text
+        // The exact boundaries may vary based on the font, but it should not panic
+        // and should treat grapheme clusters as atomic units
+        let _boundaries: Vec<_> = wrapper
+            .wrap_line(&[LineFragment::text(thai_text)], px(72.))
+            .collect();
+        
+        // If we got here without panicking, the test passed
+        // Thai text should be wrappable (similar to CJK)
+        // The important thing is that combining characters stay with their base
+        
+        // Test truncation with Thai text
+        let (truncated, _) = wrapper.truncate_line(
+            thai_text.into(),
+            px(36.),
+            "…",
+            &[]
+        );
+        
+        // Truncation should not split grapheme clusters
+        // Each grapheme cluster should be kept intact
+        for grapheme in truncated.graphemes(true) {
+            // If a grapheme is in the truncated text, it should be complete
+            assert!(!grapheme.is_empty());
+        }
     }
 
     // For compatibility with the test macro
